@@ -1,128 +1,189 @@
+#!/usr/bin/env python3
+"""
+Native Messaging Host for AntiGravity IDE Bridge
+=================================================
+This script handles communication between Chrome extension and the Bridge Server.
+Chrome sends JSON messages via stdin, and we respond via stdout.
+"""
 
-set -e
+import json
+import struct
+import subprocess
+import sys
+import os
+import signal
+import time
+import urllib.request
+import urllib.error
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# Global reference to server process
+server_process = None
 
-HOST_NAME="com.browserbridge.host"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HOST_PATH="${SCRIPT_DIR}/native_host.py"
 
-echo -e "${BLUE}============================================${NC}"
-echo -e "${BLUE}  Browser Bridge Installer${NC}"
-echo -e "${BLUE}============================================${NC}"
-echo ""
+def get_script_dir():
+    """Get the directory where this script is located."""
+    return os.path.dirname(os.path.abspath(__file__))
 
-# Check for extension ID
-if [ -z "$1" ]; then
-    echo -e "${RED}Error: Extension ID required${NC}"
-    echo ""
-    echo "Usage: ./install_host.sh <EXTENSION_ID>"
-    echo ""
-    echo "To find your Extension ID:"
-    echo "  1. Open chrome://extensions (or browser equivalent)"
-    echo "  2. Enable 'Developer mode'"
-    echo "  3. Load the extension folder"
-    echo "  4. Copy the ID shown"
-    echo ""
-    exit 1
-fi
 
-EXTENSION_ID="$1"
+def send_message(message):
+    """Send a message to Chrome extension via stdout."""
+    encoded = json.dumps(message).encode('utf-8')
+    # Chrome native messaging protocol: 4-byte length prefix (little-endian)
+    sys.stdout.buffer.write(struct.pack('<I', len(encoded)))
+    sys.stdout.buffer.write(encoded)
+    sys.stdout.buffer.flush()
 
-echo -e "${YELLOW}Extension ID:${NC} $EXTENSION_ID"
-echo -e "${YELLOW}Host Script:${NC} $HOST_PATH"
-echo ""
 
-# Make host script executable
-chmod +x "$HOST_PATH"
-echo -e "${GREEN}✓${NC} Made native_host.py executable"
-
-# Create manifest function
-create_manifest() {
-    local dest_dir="$1"
-    local browser_name="$2"
-    local manifest_path="$dest_dir/${HOST_NAME}.json"
+def read_message():
+    """Read a message from Chrome extension via stdin."""
+    # Read 4-byte length prefix
+    raw_length = sys.stdin.buffer.read(4)
+    if not raw_length:
+        return None
     
-    mkdir -p "$dest_dir" 2>/dev/null || return 1
+    # Unpack length (little-endian unsigned int)
+    message_length = struct.unpack('<I', raw_length)[0]
     
-    cat > "$manifest_path" << EOF
-{
-  "name": "${HOST_NAME}",
-  "description": "Browser Bridge - Native Messaging Host",
-  "path": "${HOST_PATH}",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://${EXTENSION_ID}/"
-  ]
-}
-EOF
-    echo -e "${GREEN}✓${NC} Installed for ${browser_name}: $manifest_path"
-    return 0
-}
+    # Read the message
+    message = sys.stdin.buffer.read(message_length).decode('utf-8')
+    return json.loads(message)
 
-# Detect OS and set browser paths
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS
-    declare -A BROWSERS=(
-        ["Chrome"]="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
-        ["Brave"]="$HOME/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts"
-        ["Edge"]="$HOME/Library/Application Support/Microsoft Edge/NativeMessagingHosts"
-        ["Opera"]="$HOME/Library/Application Support/com.operasoftware.Opera/NativeMessagingHosts"
-        ["Vivaldi"]="$HOME/Library/Application Support/Vivaldi/NativeMessagingHosts"
-        ["Arc"]="$HOME/Library/Application Support/Arc/User Data/NativeMessagingHosts"
-        ["Chromium"]="$HOME/Library/Application Support/Chromium/NativeMessagingHosts"
-    )
-elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    # Linux
-    declare -A BROWSERS=(
-        ["Chrome"]="$HOME/.config/google-chrome/NativeMessagingHosts"
-        ["Brave"]="$HOME/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts"
-        ["Edge"]="$HOME/.config/microsoft-edge/NativeMessagingHosts"
-        ["Opera"]="$HOME/.config/opera/NativeMessagingHosts"
-        ["Vivaldi"]="$HOME/.config/vivaldi/NativeMessagingHosts"
-        ["Chromium"]="$HOME/.config/chromium/NativeMessagingHosts"
-    )
-else
-    echo -e "${RED}Error: Unsupported OS: $OSTYPE${NC}"
-    echo "For Windows, please install manually."
-    exit 1
-fi
 
-# Install for all browsers
-echo ""
-echo -e "${YELLOW}Installing for detected browsers...${NC}"
-installed_count=0
+def check_server_health():
+    """Check if the Bridge Server is running by hitting the health endpoint."""
+    try:
+        req = urllib.request.Request(
+            'http://127.0.0.1:8000/health',
+            method='GET'
+        )
+        with urllib.request.urlopen(req, timeout=2) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode('utf-8'))
+                return {
+                    'running': True,
+                    'browser_connected': data.get('browser_connected', False)
+                }
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+        pass
+    
+    return {'running': False, 'browser_connected': False}
 
-for browser in "${!BROWSERS[@]}"; do
-    dir="${BROWSERS[$browser]}"
-    # Check if browser's parent directory exists (browser is installed)
-    parent_dir=$(dirname "$dir")
-    if [ -d "$parent_dir" ]; then
-        if create_manifest "$dir" "$browser"; then
-            ((installed_count++))
-        fi
-    fi
-done
 
-if [ $installed_count -eq 0 ]; then
-    echo -e "${YELLOW}No browsers detected. Creating for Chrome anyway...${NC}"
-    create_manifest "${BROWSERS["Chrome"]}" "Chrome"
-fi
+def start_server():
+    """Start the Bridge Server as a subprocess."""
+    global server_process
+    
+    # Check if already running
+    status = check_server_health()
+    if status['running']:
+        return {'success': True, 'message': 'Server already running'}
+    
+    try:
+        script_dir = get_script_dir()
+        server_script = os.path.join(script_dir, 'bridge_server.py')
+        
+        if not os.path.exists(server_script):
+            return {'success': False, 'message': f'Server script not found: {server_script}'}
+        
+        # Start server in background
+        # Use pythonw on Windows to avoid console, python3 on Mac/Linux
+        python_cmd = sys.executable
+        
+        server_process = subprocess.Popen(
+            [python_cmd, server_script],
+            cwd=script_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True  # Detach from parent process
+        )
+        
+        # Wait a moment for server to start
+        time.sleep(1.5)
+        
+        # Verify it started
+        status = check_server_health()
+        if status['running']:
+            return {'success': True, 'message': 'Server started successfully', 'pid': server_process.pid}
+        else:
+            return {'success': False, 'message': 'Server failed to start'}
+    
+    except Exception as e:
+        return {'success': False, 'message': f'Error starting server: {str(e)}'}
 
-echo ""
-echo -e "${GREEN}============================================${NC}"
-echo -e "${GREEN}  Installation Complete!${NC}"
-echo -e "${GREEN}============================================${NC}"
-echo ""
-echo -e "Installed for ${GREEN}$installed_count${NC} browser(s)"
-echo ""
-echo -e "Next steps:"
-echo -e "  1. ${YELLOW}Restart your browser${NC} (close all windows)"
-echo -e "  2. Open the Browser Bridge extension popup"
-echo -e "  3. Click '${BLUE}Connect${NC}' to begin"
-echo ""
+
+def stop_server():
+    """Stop the Bridge Server."""
+    global server_process
+    
+    # First try to kill our tracked process
+    if server_process:
+        try:
+            server_process.terminate()
+            server_process.wait(timeout=3)
+            server_process = None
+        except:
+            pass
+    
+    # Also try to find and kill any server on port 8000
+    try:
+        # Use lsof to find process on port 8000 (Mac/Linux)
+        result = subprocess.run(
+            ['lsof', '-ti', ':8000'],
+            capture_output=True,
+            text=True
+        )
+        if result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                except:
+                    pass
+    except:
+        pass
+    
+    # Verify it stopped
+    time.sleep(0.5)
+    status = check_server_health()
+    
+    if not status['running']:
+        return {'success': True, 'message': 'Server stopped'}
+    else:
+        return {'success': False, 'message': 'Server may still be running'}
+
+
+def handle_message(message):
+    """Process incoming message and return response."""
+    command = message.get('command', '')
+    
+    if command == 'start_server':
+        return start_server()
+    
+    elif command == 'stop_server':
+        return stop_server()
+    
+    elif command == 'check_status':
+        status = check_server_health()
+        return {
+            'success': True,
+            'server_running': status['running'],
+            'browser_connected': status['browser_connected']
+        }
+    
+    else:
+        return {'success': False, 'message': f'Unknown command: {command}'}
+
+
+def main():
+    """Main loop to handle messages from Chrome."""
+    while True:
+        message = read_message()
+        if message is None:
+            break
+        
+        response = handle_message(message)
+        send_message(response)
+
+
+if __name__ == '__main__':
+    main()
